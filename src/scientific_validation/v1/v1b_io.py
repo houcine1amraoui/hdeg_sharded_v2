@@ -9,7 +9,7 @@ import json
 
 import numpy as np
 import torch
-from src.utils.device import get_device
+
 
 
 LEVEL_DIRS = {
@@ -62,6 +62,7 @@ def load_representation_shard(
     *,
     return_metadata: bool = False,
     levels: Optional[Iterable[str]] = None,
+    expected_checkpoint_sha256: str | None = None,
 ):
     """Load one HDEG representation shard.
 
@@ -70,7 +71,6 @@ def load_representation_shard(
     each level so the V1 eligibility layer can verify sample ranges and
     provenance without inventing a parallel schema.
     """
-    device = get_device()
     result = {}
     metadata = {}
     requested_levels = tuple(LEVEL_DIRS) if levels is None else tuple(levels)
@@ -83,11 +83,22 @@ def load_representation_shard(
         p = Path(f"{artifact_root}/{dirname}/{split}/shard_{shard_index:06d}.pt")
         if not p.exists():
             raise FileNotFoundError(p)
-        obj = torch.load(p, map_location=device)
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+        if expected_checkpoint_sha256 is not None:
+            stages = tuple(LEVEL_DIRS.values())
+            for field in ("model_checkpoint_sha256",) + tuple(
+                f"source_{stage}_checkpoint_sha256"
+                for stage in stages[:stages.index(dirname)]
+            ):
+                if obj.get(field) != expected_checkpoint_sha256:
+                    raise RuntimeError(f"{p}: checkpoint mismatch in {field}")
+            for stage in stages[:stages.index(dirname)]:
+                if obj.get(f"source_{stage}_shard_index") != shard_index:
+                    raise RuntimeError(f"{p}: source_{stage}_shard_index mismatch")
         tensor = _extract_tensor(obj, REPRESENTATION_KEY)
         result[level] = tensor.detach().cpu().numpy()
         if return_metadata:
-            metadata[level] = dict(obj)
+            metadata[level] = {k: v for k, v in obj.items() if k != REPRESENTATION_KEY}
 
     if return_metadata:
         return result, metadata
@@ -98,17 +109,22 @@ def discover_shards(
     artifact_root: Path,
     split: str,
 ) -> list[int]:
-    first = f"{artifact_root}/dbrl/{split}"
-    print(f"Discovering representation shards in {first}...")
-    if not Path(first).exists():
-        return []
-    out = []
-    for p in sorted(Path(first).glob("shard_*.pt")):
-        try:
-            out.append(int(p.stem.split("_")[-1]))
-        except ValueError:
-            continue
-    return out
+    all_ids = []
+    for stage in LEVEL_DIRS.values():
+        directory = Path(artifact_root) / stage / split
+        ids = []
+        for p in directory.glob("shard_*.pt"):
+            text = p.stem.removeprefix("shard_")
+            if not text.isdigit():
+                raise ValueError(f"Invalid shard name: {p}")
+            ids.append(int(text))
+        ids.sort()
+        if not ids or ids != list(range(len(ids))):
+            raise RuntimeError(f"Missing/non-contiguous shards: {directory}")
+        all_ids.append(ids)
+    if any(ids != all_ids[0] for ids in all_ids[1:]):
+        raise RuntimeError(f"Cross-level shard counts differ for {split}")
+    return all_ids[0]
 
 
 def load_window_shard(
@@ -125,9 +141,10 @@ def load_window_shard(
 
 
 def save_json(path: Path, obj: dict) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(obj, indent=2, sort_keys=True, default=_json_default),
+        json.dumps(obj, indent=2, sort_keys=True, default=_json_default, allow_nan=False),
         encoding="utf-8",
     )
 

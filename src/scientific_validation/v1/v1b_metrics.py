@@ -83,9 +83,11 @@ def behavioral_window_distance(x1: np.ndarray, x2: np.ndarray) -> float:
     ) / float(x1.size))
 
 
-def spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
+def spearman_rho(x: np.ndarray, y: np.ndarray) -> float | None:
     """Spearman rank correlation without requiring sklearn."""
     from scipy.stats import spearmanr
+    if len(x) < 2 or np.all(x == x[0]) or np.all(y == y[0]):
+        return None
     r = spearmanr(x, y)
     return float(r.statistic)
 
@@ -364,6 +366,10 @@ def bootstrap_energy_ci(
     Distance implementation is replaced by the bounded-memory multivariate
     kernel above.
     """
+    if replicates <= 0 or not 0 < confidence < 1:
+        raise ValueError("Positive replicates and confidence in (0,1) required.")
+    if block_length <= 0 or block_length >= min(len(x), len(y)):
+        raise ValueError("Bootstrap block length must be smaller than both populations.")
     x = np.asarray(x)
     y = np.asarray(y)
     rng = np.random.default_rng(seed)

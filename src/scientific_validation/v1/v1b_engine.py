@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import time
 import gc
+import json
+import hashlib
 
 import numpy as np
 from tqdm import tqdm
@@ -50,6 +52,8 @@ class V1BConfig:
     artifact_root: Path
     window_root: Path
     output_root: Path
+    checkpoint_sha256: str = ""
+    num_states: int = 9
     dataset: str = "CU"
     seed: int = 42
     window_size: int = 30
@@ -67,13 +71,41 @@ class V1BConfig:
 class V1BEngine:
     def __init__(self, cfg: V1BConfig):
         self.cfg = cfg
+        self._manifests = {}
+        if len(cfg.checkpoint_sha256) != 64:
+            raise ValueError("A selected checkpoint SHA256 is required.")
+        for key in ("r2_pair_count", "r3_max_per_condition", "r1_reservoir_size",
+                    "r1_chunk_size", "r3_block_length_windows"):
+            if getattr(cfg, key) <= 0:
+                raise ValueError(f"{key} must be positive")
+        if cfg.r1_chunk_size < 2 or cfg.bootstrap_replicates < 0:
+            raise ValueError("R1 chunk must be >=2; bootstrap replicates must be >=0.")
+
+    def _load_representation_shard(self, *args, **kwargs):
+        return load_representation_shard(
+            *args, **kwargs, expected_checkpoint_sha256=self.cfg.checkpoint_sha256
+        )
+
+    def preflight(self) -> dict:
+        manifests = {split: self._build_split_index_manifest(split)
+                     for split in R3_CONDITIONS.values()}
+        return {
+            "status": "PASS", "scope": "Level 1 input eligibility only",
+            "checkpoint_sha256": self.cfg.checkpoint_sha256,
+            "splits": manifests,
+            "r3_uncertainty": (
+                "Sparse sampled rows are not consecutive windows. CIs are withheld "
+                "for sparse samples; full-population contiguous samples may use MBB."
+            ),
+            "scientific_tests_executed": False,
+        }
 
     def _shape_gate(self, reps: Dict[str, np.ndarray]) -> Tuple[bool, str]:
         expected_tail = {
-            "Z": (23, 64),
-            "S": (9, 64),
-            "S_tilde": (9, 64),
-            "g": (64,),
+            "Z": (self.cfg.num_devices, self.cfg.representation_dim),
+            "S": (self.cfg.num_states, self.cfg.representation_dim),
+            "S_tilde": (self.cfg.num_states, self.cfg.representation_dim),
+            "g": (self.cfg.representation_dim,),
         }
         for level in LEVELS:
             if level not in reps:
@@ -97,15 +129,30 @@ class V1BEngine:
         representation tensor footprint to one level of one shard while still
         checking cross-level provenance and shapes.
         """
+        if split in self._manifests:
+            return self._manifests[split]
+        source_path = Path(self.cfg.window_root) / split / "manifest.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        if source["split"] != split:
+            raise RuntimeError(f"{source_path}: split mismatch")
+        if (int(source["num_devices"]), int(source["window_size"])) != (
+            self.cfg.num_devices, self.cfg.window_size
+        ):
+            raise RuntimeError(f"{source_path}: N/W mismatch")
         print(f"Building lightweight index manifest for split={split}...")
         shard_ids = discover_shards(self.cfg.artifact_root, split)
+        if len(shard_ids) != int(source["num_shards"]):
+            raise RuntimeError(f"{split}: incomplete representation shard set")
+        window_paths = sorted((Path(self.cfg.window_root) / split).glob("shard_*.npz"))
+        if [p.name for p in window_paths] != [f"shard_{sid:06d}.npz" for sid in shard_ids]:
+            raise RuntimeError(f"{split}: window/representation shard set mismatch")
         if not shard_ids:
             raise RuntimeError(f"No representation shards for split={split}")
 
         expected_tails = {
             "Z": (self.cfg.num_devices, self.cfg.representation_dim),
-            "S": (9, self.cfg.representation_dim),
-            "S_tilde": (9, self.cfg.representation_dim),
+            "S": (self.cfg.num_states, self.cfg.representation_dim),
+            "S_tilde": (self.cfg.num_states, self.cfg.representation_dim),
             "g": (self.cfg.representation_dim,),
         }
         shards = []
@@ -114,7 +161,7 @@ class V1BEngine:
         for sid in shard_ids:
             level_info = {}
             for level in LEVELS:
-                reps, metadata = load_representation_shard(
+                reps, metadata = self._load_representation_shard(
                     self.cfg.artifact_root,
                     split,
                     sid,
@@ -139,6 +186,15 @@ class V1BEngine:
                     )
 
                 meta = metadata[level]
+                for field, expected in (
+                    ("window_size", self.cfg.window_size),
+                    ("num_devices", self.cfg.num_devices),
+                    ("embedding_dim", self.cfg.representation_dim),
+                ):
+                    if meta.get(field) != expected:
+                        raise RuntimeError(f"{split}/{sid}/{level}: {field} mismatch")
+                if level != "Z" and meta.get("num_states") != self.cfg.num_states:
+                    raise RuntimeError(f"{split}/{sid}/{level}: num_states mismatch")
                 required = ("split", "shard_index", "start_index", "end_index")
                 missing = [k for k in required if k not in meta]
                 if missing:
@@ -181,7 +237,7 @@ class V1BEngine:
             start_index = reference["start_index"]
             end_index = reference["end_index"]
             sample_count = end_index - start_index
-            if sample_count != reference["sample_count"]:
+            if sample_count <= 0 or sample_count != reference["sample_count"]:
                 raise RuntimeError(
                     f"Range/sample-count mismatch for {split}/{sid:06d}: "
                     f"range_count={sample_count}, "
@@ -194,6 +250,14 @@ class V1BEngine:
                     f"observed={start_index} at shard {sid:06d}"
                 )
 
+            window_path = Path(self.cfg.window_root) / split / f"shard_{sid:06d}.npz"
+            with np.load(window_path, allow_pickle=False) as archive:
+                for field, value in (("split", split), ("shard_index", sid),
+                                     ("start_index", start_index), ("end_index", end_index),
+                                     ("window_size", self.cfg.window_size),
+                                     ("num_devices", self.cfg.num_devices)):
+                    if archive[field].item() != value:
+                        raise RuntimeError(f"{window_path}: {field} mismatch")
             shards.append({
                 "shard_index": int(sid),
                 "start_index": int(start_index),
@@ -202,11 +266,14 @@ class V1BEngine:
             })
             expected_start = end_index
 
-        return {
-            "split": split,
-            "sample_count": int(expected_start),
-            "shards": shards,
+        if expected_start != int(source["num_samples"]):
+            raise RuntimeError(f"{split}: incomplete sample coverage")
+        result = {
+            "split": split, "sample_count": int(expected_start), "shards": shards,
+            "window_manifest_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
         }
+        self._manifests[split] = result
+        return result
 
     @staticmethod
     def _group_global_indices_by_shard(
@@ -305,7 +372,7 @@ class V1BEngine:
         # Allocate only the bounded selected population. The shape is obtained
         # from the first selected shard, not from the whole split.
         first_sid = next(iter(grouped))
-        first_reps, _ = load_representation_shard(
+        first_reps, _ = self._load_representation_shard(
             self.cfg.artifact_root,
             split,
             first_sid,
@@ -327,7 +394,7 @@ class V1BEngine:
 
         loaded_shards = []
         for sid, local_indices in grouped.items():
-            reps, metadata = load_representation_shard(
+            reps, metadata = self._load_representation_shard(
                 self.cfg.artifact_root,
                 split,
                 sid,
@@ -399,7 +466,7 @@ class V1BEngine:
 
         grouped = self._group_global_indices_by_shard(manifest, selected_global)
         first_sid = next(iter(grouped))
-        first_reps = load_representation_shard(
+        first_reps = self._load_representation_shard(
             self.cfg.artifact_root,
             split,
             first_sid,
@@ -420,7 +487,7 @@ class V1BEngine:
         }
 
         for sid, local_indices in grouped.items():
-            reps = load_representation_shard(
+            reps = self._load_representation_shard(
                 self.cfg.artifact_root,
                 split,
                 sid,
@@ -461,7 +528,7 @@ class V1BEngine:
 
         for split in splits:
             for sid in discover_shards(self.cfg.artifact_root, split):
-                reps = load_representation_shard(
+                reps = self._load_representation_shard(
                     self.cfg.artifact_root, split, sid
                 )
                 ok, reason = self._shape_gate(reps)
@@ -470,7 +537,7 @@ class V1BEngine:
                         "eligible": False,
                         "reason": reason,
                     }
-                    continue
+                    raise RuntimeError(f"R1 ineligible shard: {split}/{sid}: {reason}")
 
                 eligible += 1
                 n = reps["g"].shape[0]
@@ -494,6 +561,8 @@ class V1BEngine:
         return {
             "measurement_family": "within_level_representation_geometry",
             "scope": "val + actor2_test + actor1_test",
+            "pair_population": "within each temporal chunk within each shard; pooled across splits",
+            "limitation": "Local-chunk geometry, not global pair geometry or proof of semantic coherence",
             "reservoir_capacity": self.cfg.r1_reservoir_size,
             "chunk_size": self.cfg.r1_chunk_size,
             "levels": summaries,
@@ -661,7 +730,7 @@ class V1BEngine:
         endpoint_reps = {}
 
         # Determine representation tails from the first required shard.
-        first_reps, _ = load_representation_shard(
+        first_reps, _ = self._load_representation_shard(
             self.cfg.artifact_root,
             first_split,
             first_sid,
@@ -686,7 +755,7 @@ class V1BEngine:
             }
 
             for sid, local_indices in shard_requests[split].items():
-                reps, metadata = load_representation_shard(
+                reps, metadata = self._load_representation_shard(
                     self.cfg.artifact_root,
                     split,
                     sid,
@@ -719,6 +788,14 @@ class V1BEngine:
                         f"{split}/{sid:06d}"
                     )
                 windows = np.asarray(window_obj[window_key])
+                if tuple(windows.shape[1:]) != expected_tail or not np.isfinite(windows).all():
+                    raise RuntimeError(f"Invalid windows in {split}/{sid:06d}")
+                for field, expected_value in (
+                    ("split", split), ("shard_index", sid),
+                    ("start_index", start_index), ("end_index", end_index),
+                ):
+                    if np.asarray(window_obj[field]).item() != expected_value:
+                        raise RuntimeError(f"Window metadata mismatch: {split}/{sid}/{field}")
                 if windows.shape[0] != shard_n:
                     raise RuntimeError(
                         f"Window sample-count mismatch for {split}/{sid:06d}: "
@@ -788,6 +865,9 @@ class V1BEngine:
             "selected_shards": selected_shards,
         }
 
+        self._r2_pair_metadata = pair_meta
+        self._r2_pair_metadata["pair_index_sha256"] = hashlib.sha256(pairs.astype("<i8").tobytes()).hexdigest()
+
         # endpoint_X / endpoint_reps are intentionally returned rather than
         # pair-expanded arrays.  run_r2 indexes them using compact_pairs, so
         # memory remains proportional to unique endpoints rather than twice
@@ -834,6 +914,7 @@ class V1BEngine:
         return {
             "measurement_family": "behavioral_relationship_preservation",
             "pair_count": int(len(pairs)),
+            "sampling_manifest": self._r2_pair_metadata,
             "seed": self.cfg.seed,
             "pair_sampling": "deterministic_representation_blind_without_replacement",
             "behavior_distance": {
@@ -846,21 +927,15 @@ class V1BEngine:
                 l: spearman_rho(bx, dists[l]) for l in LEVELS
             },
             "pair_strata": strata,
+            "limitation": "Pooled correlation can reflect between-condition differences; undefined correlations are null",
         }
 
     def run_r3(self) -> dict:
-        """Execute R3 with comparison- and level-streamed memory scheduling.
+        """Compute exact sampled distribution contrasts one level at a time.
 
-        Scientific semantics are unchanged:
-        - the three fixed conditions remain N1/A2/N2;
-        - each condition gets one deterministic representation-blind sample;
-        - the same sampled indices are reused across all hierarchy levels;
-        - the three authorized contrasts are unchanged;
-        - the existing ``bootstrap_energy_ci`` metric implementation is used
-          unchanged.
-
-        Only the execution schedule changes: at most two conditions and one
-        representation level are resident for a comparison.
+        Random row sampling is preserved for point estimates. Moving-block
+        bootstrap is allowed only when the selected sample is the complete
+        chronological sequence; sparse samples receive no temporal CI.
         """
         condition_order = tuple(R3_CONDITIONS.keys())
         sampling_seeds = {
@@ -911,11 +986,13 @@ class V1BEngine:
                 "N2": "actor1_test",
             },
             "sample_counts": populations,
+            "interpretation": "Actor/period distribution contrasts; not anomaly-label separation",
+            "limitation": "Exact quadratic-cost point estimates; sparse-sample temporal CIs withheld",
             "comparisons": {},
             "uncertainty": {
-                "method": "moving_block_bootstrap",
+                "method": "moving_block_bootstrap_only_for_complete_temporal_sequences",
                 "block_length_windows": self.cfg.r3_block_length_windows,
-                "bootstrap_replicates": self.cfg.bootstrap_replicates,
+                "requested_bootstrap_replicates": self.cfg.bootstrap_replicates,
                 "confidence_level": 0.95,
                 "interval_method": "percentile",
             },
@@ -948,13 +1025,26 @@ class V1BEngine:
                 )
 
                 try:
-                    ci = bootstrap_energy_ci(
-                        x.reshape(len(x), -1),
-                        y.reshape(len(y), -1),
-                        block_length=self.cfg.r3_block_length_windows,
-                        replicates=self.cfg.bootstrap_replicates,
-                        seed=self.cfg.bootstrap_seed,
+                    contiguous = all(
+                        len(sampling_plan[c]) == manifests[c]["sample_count"]
+                        for c in (a, b)
                     )
+                    if contiguous and self.cfg.bootstrap_replicates > 0:
+                        ci = bootstrap_energy_ci(
+                            x.reshape(len(x), -1), y.reshape(len(y), -1),
+                            block_length=self.cfg.r3_block_length_windows,
+                            replicates=self.cfg.bootstrap_replicates,
+                            seed=self.cfg.bootstrap_seed,
+                        )
+                        ci["uncertainty_status"] = "computed_on_complete_temporal_sequence"
+                    else:
+                        ci = {
+                            "point_estimate": energy_distance(x, y),
+                            "ci_lower": None, "ci_upper": None,
+                            "uncertainty_status": "not_estimated",
+                            "reason": ("sparse_sample_breaks_temporal_blocks" if not contiguous
+                                       else "bootstrap_disabled"),
+                        }
                     result["comparisons"][key][level] = ci
                 finally:
                     # Do not retain the large selected arrays after the scalar
@@ -977,12 +1067,16 @@ class V1BEngine:
         return result
 
     def run(self) -> dict:
+        preflight = self.preflight()
         started = time.time()
 
         evidence = {
             "manifest": {
                 "engine": "HDEG V1-B Scientific Validation Engine",
-                "version": "1.0",
+                "version": "1.1",
+                "checkpoint_sha256": self.cfg.checkpoint_sha256,
+                "num_states": self.cfg.num_states,
+                "protocol_status": "quantitative_operationalization; qualitative evidence and claim synthesis pending",
                 "dataset": self.cfg.dataset,
                 "seed": self.cfg.seed,
                 "window_size": self.cfg.window_size,
@@ -993,9 +1087,10 @@ class V1BEngine:
                 "r3_block_length_windows": self.cfg.r3_block_length_windows,
                 "claim_decision": "not_performed",
             },
-            # "r1": self.run_r1(),
-            # "r2": self.run_r2(),
+            "r1": self.run_r1(),
+            "r2": self.run_r2(),
             "r3": self.run_r3(),
+            "preflight": preflight,
             "provenance": {
                 "execution_started_unix": started,
                 "execution_finished_unix": time.time(),
