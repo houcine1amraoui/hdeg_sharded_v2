@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import gc
 import json
 from pathlib import Path
@@ -609,6 +610,7 @@ def save_representation_shard(
     batch_size: int,
     seed: int,
     overwrite: bool,
+    checkpoint_metadata: dict,
 ) -> None:
     """Persist one DBRL representation shard."""
 
@@ -636,6 +638,7 @@ def save_representation_shard(
         "batch_size": batch_size,
         "seed": seed,
     }
+    payload.update(checkpoint_metadata)
 
     torch.save(
         payload,
@@ -646,6 +649,56 @@ def save_representation_shard(
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
+
+def load_trained_dbrl(model: DBRL, checkpoint_path: Path, config: dict) -> dict:
+    """Restore the DBRL branch saved by train_hdeg_e2e.py."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"HDEG checkpoint not found: {checkpoint_path}")
+
+    # Load on CPU so the full model and optimizer do not occupy GPU memory.
+    # This is the trusted checkpoint produced by the project's training script.
+    with checkpoint_path.open("rb") as file:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+        file.seek(0)
+        payload = torch.load(file, map_location="cpu", weights_only=False)
+
+    if not isinstance(payload, dict):
+        raise TypeError("Expected an end-to-end HDEG checkpoint dictionary.")
+    state = payload.get("model_state_dict")
+    saved_config = payload.get("config")
+    if not isinstance(state, dict) or not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint must contain model_state_dict and config.")
+
+    # Strict weight loading cannot detect changes to graph construction rules.
+    for key in (
+        "hidden_dim", "embedding_dim", "gru_layers", "graph_top_k",
+        "graph_self_loops", "graph_symmetric", "graph_heads",
+    ):
+        if saved_config["hdeg"]["dbrl"][key] != config["hdeg"]["dbrl"][key]:
+            raise ValueError(f"DBRL checkpoint/config mismatch: {key}")
+    for key in ("dataset_name", "merge_bre_cu", "window_size", "downsample_freq"):
+        if saved_config["preprocessing"][key] != config["preprocessing"][key]:
+            raise ValueError(f"Preprocessing checkpoint/config mismatch: {key}")
+
+    dbrl_state = {
+        key[len("dbrl."):]: value
+        for key, value in state.items()
+        if isinstance(key, str) and key.startswith("dbrl.")
+    }
+    if not dbrl_state:
+        raise ValueError("Checkpoint contains no dbrl. parameters.")
+    model.load_state_dict(dbrl_state, strict=True)
+    model.eval()
+
+    return {
+        "model_checkpoint": str(checkpoint_path.resolve()),
+        "model_checkpoint_sha256": digest.hexdigest(),
+        "model_checkpoint_epoch": int(payload["epoch"]),
+        "model_source": "train_hdeg_e2e.py checkpoint / dbrl submodule",
+    }
+
 
 def main() -> None:
 
@@ -843,7 +896,17 @@ def main() -> None:
         num_devices=num_devices,
     ).to(device)
 
-    print("DBRL model constructed successfully.")
+    checkpoint = config["hdeg"]["hbf"]["checkpoint"]
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path(processed_data_folder) / "hdeg_checkpoints" / checkpoint_path
+    checkpoint_metadata = load_trained_dbrl(model, checkpoint_path, config)
+
+    print(f"Trained DBRL loaded: {checkpoint_path}")
+    print(f"Checkpoint epoch: {checkpoint_metadata['model_checkpoint_epoch']}")
+    print(f"Checkpoint SHA256: {checkpoint_metadata['model_checkpoint_sha256']}")
     print()
 
     # -------------------------------------------------------------
@@ -1007,6 +1070,7 @@ def main() -> None:
             "embedding_dim": embedding_dim,
             "batch_size": batch_size,
             "seed": int(config["seed"]),
+            "checkpoint_metadata": checkpoint_metadata,
             "overwrite": (
                 overwrite
                 or bool(
