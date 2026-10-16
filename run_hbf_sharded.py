@@ -71,6 +71,7 @@ def validate_upstream_bundle(
     expected_num_devices: Optional[int],
     expected_num_states: Optional[int],
     expected_embedding_dim: Optional[int],
+    expected_checkpoint_sha256: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     dbrl = load_payload(dbrl_path)
     bse = load_payload(bse_path)
@@ -84,6 +85,25 @@ def validate_upstream_bundle(
             raise KeyError(f"{label} shard missing metadata: {missing}")
         if payload["split"] != expected_split:
             raise ValueError(f"{label} split mismatch: {payload['split']} != {expected_split}")
+
+    # Validate each artifact and every recorded upstream checkpoint identity.
+    for label, payload, path, upstream_levels in (
+        ("DBRL", dbrl, dbrl_path, ()),
+        ("BSE", bse, bse_path, ("dbrl",)),
+        ("BIL", bil, bil_path, ("dbrl", "bse")),
+        ("EBRL", ebrl, ebrl_path, ("dbrl", "bse", "bil")),
+    ):
+        fields = ("model_checkpoint_sha256",) + tuple(
+            f"source_{level}_checkpoint_sha256" for level in upstream_levels
+        )
+        for field in fields:
+            observed = payload.get(field)
+            if observed != expected_checkpoint_sha256:
+                raise ValueError(
+                    f"{label} checkpoint mismatch in {path}: {field}: "
+                    f"expected={expected_checkpoint_sha256}, observed={observed!r}. "
+                    "Regenerate upstream artifacts with the same HDEG checkpoint."
+                )
 
     paths = (dbrl_path, bse_path, bil_path, ebrl_path)
     payloads = (dbrl, bse, bil, ebrl)
@@ -237,6 +257,10 @@ def save_output(path: Path, outputs: dict[str, Tensor], *, upstream: dict[str, A
         "model_checkpoint_epoch": int(checkpoint_epoch),
         "model_checkpoint_metrics": checkpoint_metrics,
         "model_source": "train_hdeg_e2e.py checkpoint / hbf submodule",
+        "source_ebrl_checkpoint_sha256": upstream["model_checkpoint_sha256"],
+        "source_bil_checkpoint_sha256": upstream["source_bil_checkpoint_sha256"],
+        "source_bse_checkpoint_sha256": upstream["source_bse_checkpoint_sha256"],
+        "source_dbrl_checkpoint_sha256": upstream["source_dbrl_checkpoint_sha256"],
     }
     torch.save(payload, path)
 
@@ -266,25 +290,25 @@ def main() -> None:
     seed = int(config["seed"])
     set_seed(seed)
 
-    batch_size = config["hdeg"]["ebrl"].get("batch_size", 32)
-    max_shards = config["hdeg"]["ebrl"].get("max_shards", None)
-    overwrite = config["hdeg"]["ebrl"].get("overwrite", False)
+    batch_size = config["hdeg"]["hbf"].get("batch_size", 32)
+    max_shards = config["hdeg"]["hbf"].get("max_shards", None)
+    overwrite = config["hdeg"]["hbf"].get("overwrite", False)
 
     
-    root = config["project_root_dir"]
-    dataset_name = config["preprocessing"]["dataset_name"]
     hidden = int(config["hdeg"]["hbf"].get("dynamics_hidden_dim", 128))
+    base = Path(get_processed_folder(config))
 
-    base = f"{root}/data/processed/{dataset_name}"
-
-    checkpoint = config["hdeg"]["hbf"].get("checkpoint", None)
-
-    checkpoint_path = Path(f"{root}/data/processed/{dataset_name}/hdeg_checkpoints/{checkpoint}")
+    checkpoint = config["hdeg"]["hbf"].get("checkpoint")
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = base / "hdeg_checkpoints" / checkpoint_path
 
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
             f"Trained HDEG checkpoint not found: {checkpoint_path}. "
-            "Pass --checkpoint explicitly. A fresh HBF is no longer allowed."
+            "Set hdeg.hbf.checkpoint to an existing trained HDEG checkpoint."
         )
     checkpoint_sha256 = sha256_file(checkpoint_path)
 
@@ -316,6 +340,7 @@ def main() -> None:
         expected_num_devices=None,
         expected_num_states=None,
         expected_embedding_dim=None,
+        expected_checkpoint_sha256=checkpoint_sha256,
     )
     Z0 = first[0]["representations"]
     N, D = int(Z0.shape[1]), int(Z0.shape[2])
@@ -348,7 +373,9 @@ def main() -> None:
             expected_num_devices=N,
             expected_num_states=K,
             expected_embedding_dim=D,
+            expected_checkpoint_sha256=checkpoint_sha256,
         )
+        print(f"[PASS] shard {i:06d}: all upstream checkpoint hashes match HBF checkpoint.")
         start = int(ebrl["start_index"])
         end = int(ebrl["end_index"])
         if expected_next_start is not None and start != expected_next_start:
@@ -378,6 +405,14 @@ def main() -> None:
                 raise RuntimeError(f"Saved HBF artifact verification failed for {out_path}, field {key}.")
         if int(saved["start_index"]) != start or int(saved["end_index"]) != end or int(saved["shard_index"]) != i:
             raise RuntimeError(f"Saved HBF metadata verification failed for {out_path}.")
+
+        for field in (
+            "model_checkpoint_sha256", "source_dbrl_checkpoint_sha256",
+            "source_bse_checkpoint_sha256", "source_bil_checkpoint_sha256",
+            "source_ebrl_checkpoint_sha256",
+        ):
+            if saved.get(field) != checkpoint_sha256:
+                raise RuntimeError(f"Saved HBF checkpoint provenance mismatch: {out_path}, {field}")
 
         print(f"  [PASS] shard {i:06d}: [{start}, {end}) -> {out_path}")
         processed_samples += end - start
