@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import gc
 from pathlib import Path
 from typing import Any, Optional
@@ -254,6 +255,7 @@ def save_ebrl_representation_shard(
     embedding_dim: int,
     seed: int,
     overwrite: bool,
+    checkpoint_metadata: dict,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -307,6 +309,11 @@ def save_ebrl_representation_shard(
         "ebrl_attention": "tanh_projection_score_softmax_weighted_sum",
     }
 
+    payload.update(checkpoint_metadata)
+    payload["source_bil_checkpoint_sha256"] = source_bil_payload["model_checkpoint_sha256"]
+    payload["source_bse_checkpoint_sha256"] = source_bil_payload["source_bse_checkpoint_sha256"]
+    payload["source_dbrl_checkpoint_sha256"] = source_bil_payload["source_dbrl_checkpoint_sha256"]
+
     torch.save(payload, output_path)
 
 
@@ -314,6 +321,7 @@ def validate_ebrl_output_artifact(
     output_path: Path,
     *,
     source_payload: dict[str, Any],
+    checkpoint_metadata: dict,
 ) -> None:
     payload = torch.load(
         output_path,
@@ -323,6 +331,17 @@ def validate_ebrl_output_artifact(
 
     if not isinstance(payload, dict):
         raise TypeError(f"EBRL output {output_path} is not a dictionary payload.")
+
+    for field, expected in checkpoint_metadata.items():
+        if payload.get(field) != expected:
+            raise ValueError(f"Saved EBRL checkpoint metadata mismatch: {field}")
+    for field in (
+        "source_bil_checkpoint_sha256",
+        "source_bse_checkpoint_sha256",
+        "source_dbrl_checkpoint_sha256",
+    ):
+        if payload.get(field) != checkpoint_metadata["model_checkpoint_sha256"]:
+            raise ValueError(f"Saved EBRL upstream checkpoint mismatch: {field}")
 
     required = (
         "representations",
@@ -372,6 +391,65 @@ def validate_ebrl_output_artifact(
         if expected is not None and payload[key] != expected:
             raise ValueError(f"EBRL provenance mismatch for '{key}'.")
 
+
+
+def load_trained_ebrl(model, checkpoint_path: Path, config: dict) -> dict:
+    """Load the trained EBRL branch from the end-to-end checkpoint."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"HDEG checkpoint not found: {checkpoint_path}")
+
+    # The trusted end-to-end checkpoint includes other modules and optimizer
+    # state; keep these on CPU while restoring only EBRL.
+    with checkpoint_path.open("rb") as file:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+        file.seek(0)
+        payload = torch.load(file, map_location="cpu", weights_only=False)
+
+    if not isinstance(payload, dict):
+        raise TypeError("Expected an end-to-end HDEG checkpoint dictionary.")
+    state = payload.get("model_state_dict")
+    saved_config = payload.get("config")
+    if not isinstance(state, dict) or not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint must contain model_state_dict and config.")
+    for key in ("dataset_name", "merge_bre_cu", "window_size", "downsample_freq"):
+        if saved_config["preprocessing"][key] != config["preprocessing"][key]:
+            raise ValueError(f"Preprocessing checkpoint/config mismatch: {key}")
+
+    ebrl_state = {
+        key[len("ebrl."):]: value
+        for key, value in state.items()
+        if isinstance(key, str) and key.startswith("ebrl.")
+    }
+    if not ebrl_state:
+        raise ValueError("Checkpoint contains no ebrl. parameters.")
+    model.load_state_dict(ebrl_state, strict=True)
+    model.eval()
+
+    return {
+        "model_checkpoint": str(checkpoint_path.resolve()),
+        "model_checkpoint_sha256": digest.hexdigest(),
+        "model_checkpoint_epoch": int(payload["epoch"]),
+        "model_source": "train_hdeg_e2e.py checkpoint / ebrl submodule",
+    }
+
+
+def verify_bil_checkpoint(payload: dict, checkpoint_metadata: dict, shard_path: Path) -> None:
+    """Check the checkpoint identity recorded for BIL, BSE, and DBRL."""
+    expected = checkpoint_metadata["model_checkpoint_sha256"]
+    for field in (
+        "model_checkpoint_sha256",
+        "source_bse_checkpoint_sha256",
+        "source_dbrl_checkpoint_sha256",
+    ):
+        observed = payload.get(field)
+        if observed != expected:
+            raise ValueError(
+                f"BIL provenance missing or mismatched in {shard_path}: "
+                f"{field}: expected={expected}, observed={observed!r}. "
+                "Regenerate upstream artifacts with the corrected exporters and the same checkpoint."
+            )
 
 
 def main() -> None:
@@ -459,7 +537,16 @@ def main() -> None:
         num_states=num_states,
         embedding_dim=embedding_dim,
     ).to(device)
-    model.eval()
+    checkpoint = config["hdeg"]["hbf"]["checkpoint"]
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path(processed_root) / "hdeg_checkpoints" / checkpoint_path
+    checkpoint_metadata = load_trained_ebrl(model, checkpoint_path, config)
+    print(f"Trained EBRL loaded: {checkpoint_path}")
+    print(f"Checkpoint epoch: {checkpoint_metadata['model_checkpoint_epoch']}")
+    print(f"Checkpoint SHA256: {checkpoint_metadata['model_checkpoint_sha256']}")
 
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"EBRL trainable params  : {parameter_count}")
@@ -477,6 +564,9 @@ def main() -> None:
             expected_num_states=num_states,
             expected_embedding_dim=embedding_dim,
         )
+
+        verify_bil_checkpoint(payload, checkpoint_metadata, shard_path)
+        print("[PASS] BIL, BSE and DBRL checkpoint hashes match EBRL checkpoint.")
 
         start_index = int(payload["start_index"])
         end_index = int(payload["end_index"])
@@ -509,11 +599,13 @@ def main() -> None:
             embedding_dim=embedding_dim,
             seed=seed,
             overwrite=overwrite,
+            checkpoint_metadata=checkpoint_metadata,
         )
 
         validate_ebrl_output_artifact(
             output_path,
             source_payload=payload,
+            checkpoint_metadata=checkpoint_metadata,
         )
 
         print(f"  [PASS] output: {output_path}")
