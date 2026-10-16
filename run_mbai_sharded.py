@@ -45,6 +45,8 @@ constructed.
 
 import argparse
 import gc
+import hashlib
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -58,6 +60,37 @@ from src.utils.get_folders_utils import get_processed_folder
 
 SPLITS = ("train", "val", "actor2_test", "actor1_test")
 LEVELS = ("Z", "S", "S_tilde", "g")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_checkpoint_provenance(
+    payload: Mapping[str, Any],
+    *,
+    path: Path,
+    stage: str,
+    expected_checkpoint_sha256: str,
+) -> None:
+    # MBAI has no trained parameters: this identifies its upstream HDEG model.
+    chain = ("dbrl", "bse", "bil", "ebrl", "hbf", "mbai")
+    upstream = chain[:chain.index(stage)]
+    fields = ("model_checkpoint_sha256",) + tuple(
+        f"source_{level}_checkpoint_sha256" for level in upstream
+    )
+    for field in fields:
+        actual = payload.get(field)
+        if actual != expected_checkpoint_sha256:
+            raise ValueError(
+                f"Checkpoint provenance mismatch in {path}: {field}: "
+                f"expected={expected_checkpoint_sha256}, observed={actual!r}. "
+                "Regenerate this artifact with the selected HDEG checkpoint."
+            )
 
 
 def parse_shard_index(path: Path) -> int:
@@ -313,6 +346,7 @@ def load_observed_bundle(
     bil_path: Path,
     ebrl_path: Path,
     *,
+    expected_checkpoint_sha256: str,
     expected_split: str,
     expected_num_devices: int,
     expected_num_states: int,
@@ -322,6 +356,15 @@ def load_observed_bundle(
     bse = load_payload(bse_path)
     bil = load_payload(bil_path)
     ebrl = load_payload(ebrl_path)
+
+    for stage, payload, path in (
+        ("dbrl", dbrl, dbrl_path), ("bse", bse, bse_path),
+        ("bil", bil, bil_path), ("ebrl", ebrl, ebrl_path),
+    ):
+        validate_checkpoint_provenance(
+            payload, path=path, stage=stage,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
 
     validate_observed_bundle(
         dbrl,
@@ -355,6 +398,16 @@ def build_output_payload(
         "E_S_tilde": evidence["E_S_tilde"].cpu(),
         "E_G": evidence["E_G"].cpu(),
         "A": evidence["A"].cpu(),
+        "model_checkpoint": hbf_payload.get("model_checkpoint"),
+        "model_checkpoint_epoch": hbf_payload.get("model_checkpoint_epoch"),
+        "model_checkpoint_sha256": hbf_payload["model_checkpoint_sha256"],
+        "model_source": "deterministic MBAI scoring of trained HDEG artifacts",
+        "source_hbf_checkpoint_sha256": hbf_payload["model_checkpoint_sha256"],
+        **{
+            f"source_{stage}_checkpoint_sha256":
+                hbf_payload[f"source_{stage}_checkpoint_sha256"]
+            for stage in ("dbrl", "bse", "bil", "ebrl")
+        },
         "split": hbf_payload["split"],
         "source_hbf_shard": hbf_payload.get("_source_path"),
         "source_hbf_shard_index": int(hbf_payload["shard_index"]),
@@ -379,11 +432,16 @@ def build_output_payload(
 def verify_mba_output_artifact(
     path: Path,
     *,
+    expected_checkpoint_sha256: str,
     expected_count: int,
     expected_start: int,
     expected_end: int,
 ) -> None:
     payload = load_payload(path)
+    validate_checkpoint_provenance(
+        payload, path=path, stage="mbai",
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+    )
 
     for key in ("E_Z", "E_S", "E_S_tilde", "E_G", "A"):
         tensor = payload.get(key)
@@ -418,6 +476,7 @@ def run_mbai_sharded(
     split: str,
     batch_size: int,
     device: torch.device,
+    expected_checkpoint_sha256: str,
     fusion_weights: Mapping[str, float] | None = None,
     max_shards: int | None = None,
     overwrite: bool = False,
@@ -481,6 +540,10 @@ def run_mbai_sharded(
     for shard_pos in range(limit):
         hbf_path = hbf_paths[shard_pos]
         hbf_payload = load_payload(hbf_path)
+        validate_checkpoint_provenance(
+            hbf_payload, path=hbf_path, stage="hbf",
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
 
         hbf_start, hbf_end = validate_hbf_payload(
             hbf_payload,
@@ -512,6 +575,7 @@ def run_mbai_sharded(
             bse_paths[shard_pos],
             bil_paths[shard_pos],
             ebrl_paths[shard_pos],
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
             expected_split=split,
             expected_num_devices=num_devices,
             expected_num_states=num_states,
@@ -598,6 +662,7 @@ def run_mbai_sharded(
                 bse_paths[shard_pos + 1],
                 bil_paths[shard_pos + 1],
                 ebrl_paths[shard_pos + 1],
+                expected_checkpoint_sha256=expected_checkpoint_sha256,
                 expected_split=split,
                 expected_num_devices=num_devices,
                 expected_num_states=num_states,
@@ -698,6 +763,8 @@ def run_mbai_sharded(
                         if boundary_count
                         else "current observed representation shard next row"
                     ),
+                    "last_prediction_excluded": not bool(boundary_count),
+                    "run_truncated": limit < len(hbf_paths),
                     "final_prediction_excluded": (
                         shard_pos == len(hbf_paths) - 1
                     ),
@@ -709,6 +776,7 @@ def run_mbai_sharded(
 
             verify_mba_output_artifact(
                 output_path,
+                expected_checkpoint_sha256=expected_checkpoint_sha256,
                 expected_count=usable,
                 expected_start=target_start,
                 expected_end=target_end,
@@ -734,63 +802,84 @@ def run_mbai_sharded(
     return total_predictions, total_assessments
 
 
-def parse_weights(text: str | None) -> dict[str, float] | None:
-    if text is None:
+def parse_weights(value: Any) -> dict[str, float] | None:
+    # YAML null is preferred; retain compatibility with existing "None".
+    if value is None or (
+        isinstance(value, str) and value.strip().lower() in ("none", "null")
+    ):
         return None
-
-    result: dict[str, float] = {}
-    for item in text.split(","):
-        key, value = item.split("=", 1)
-        key = key.strip()
-
-        if key not in LEVELS:
-            raise ValueError(f"Unknown MBAI weight key: {key}")
-
-        result[key] = float(value)
-
-    return result
+    if isinstance(value, Mapping):
+        result = dict(value)
+    elif isinstance(value, str):
+        result = {}
+        for item in value.split(","):
+            key, weight = item.split("=", 1)
+            key = key.strip()
+            if key in result:
+                raise ValueError(f"Duplicate MBAI weight key: {key}")
+            result[key] = float(weight)
+    else:
+        raise TypeError("fusion_weights must be null, a mapping, or key=value text.")
+    if set(result) != set(LEVELS):
+        raise ValueError(f"MBAI fusion weights must specify exactly {LEVELS}.")
+    for key, weight in result.items():
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise TypeError(f"MBAI weight {key} must be numeric.")
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"MBAI weight {key} must be finite and non-negative.")
+    if sum(result.values()) <= 0:
+        raise ValueError("At least one MBAI fusion weight must be positive.")
+    return {key: float(result[key]) for key in LEVELS}
 
 
 def main() -> None:
 
     with open("configs/config.yaml", "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-    
-    set_seed(config["seed"])
+        config = yaml.safe_load(f)
 
-    device = get_device()
-
-    # # parse CLI args
     parser = argparse.ArgumentParser()
     parser.add_argument("--project_root_dir", type=str)
+    parser.add_argument("--split", choices=SPLITS)
     args = parser.parse_args()
+    if args.project_root_dir is not None:
+        config["project_root_dir"] = args.project_root_dir
+    if args.split is not None:
+        config["split"] = args.split
+    split = config.get("split")
+    if split not in SPLITS:
+        raise ValueError(f"Set config split or --split to one of {SPLITS}.")
 
     seed = int(config["seed"])
     set_seed(seed)
+    device = get_device()
+    settings = config["hdeg"]["mbai"]
+    batch_size = settings.get("batch_size", 32)
+    max_shards = settings.get("max_shards")
+    overwrite = settings.get("overwrite", False)
+    fusion_weights = settings.get("fusion_weights")
 
-    batch_size = config["hdeg"]["mbai"].get("batch_size", 32)
-    max_shards = config["hdeg"]["mbai"].get("max_shards", None)
-    overwrite = config["hdeg"]["mbai"].get("overwrite", False)
-    fusion_weights = config["hdeg"]["mbai"].get("fusion_weights", None)
+    base = Path(get_processed_folder(config))
+    hbf_dir = base / "hbf" / split
+    output_dir = base / "mbai" / split
+    dbrl_dir = base / "dbrl" / split
+    bse_dir = base / "bse" / split
+    bil_dir = base / "bil" / split
+    ebrl_dir = base / "ebrl" / split
 
-    root = config["project_root_dir"]
-    split = "train"
-
-    processed_root = get_processed_folder(config)
-
-    hbf_dir = Path(f"{processed_root}/hbf/{split}")
-    output_dir = Path(f"{processed_root}/mbai/{split}")
-
-    dataset = config["preprocessing"]["dataset_name"]
-    base = f"{root}/data/processed/{dataset}"
-
-    dbrl_dir = Path(f"{base}/dbrl/{split}")
-    bse_dir = Path(f"{base}/bse/{split}")
-    bil_dir = Path(f"{base}/bil/{split}")
-    ebrl_dir = Path(f"{base}/ebrl/{split}")
+    checkpoint = config["hdeg"]["hbf"].get("checkpoint")
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = base / "hdeg_checkpoints" / checkpoint_path
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Trained HDEG checkpoint not found: {checkpoint_path}")
+    checkpoint_sha256 = sha256_file(checkpoint_path)
 
     weights = parse_weights(fusion_weights)
 
+    print(f"Checkpoint           : {checkpoint_path}")
+    print(f"Checkpoint SHA256    : {checkpoint_sha256}")
     print(f"MBAI split           : {split}")
     print(f"HBF directory        : {hbf_dir}")
     print("Observed hierarchy   : DBRL + BSE + BIL + EBRL shards")
@@ -817,6 +906,7 @@ def main() -> None:
         split=split,
         batch_size=batch_size,
         device=device,
+        expected_checkpoint_sha256=checkpoint_sha256,
         fusion_weights=weights,
         max_shards=max_shards,
         overwrite=overwrite,
