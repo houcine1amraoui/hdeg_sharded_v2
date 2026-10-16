@@ -49,36 +49,36 @@ hdeg:
     graph_heads: 1
     max_batches: null
     max_shards: null
-    overwrite: False
+    overwrite: True
 
   bse:
     batch_size: 32
     num_heads: 1
-    max_shards: None
-    overwrite: False
+    max_shards: null
+    overwrite: True
 
   bil:
     batch_size: 32
     num_heads: 1
-    max_shards: None
-    overwrite: False
+    max_shards: null
+    overwrite: True
 
   ebrl:
     batch_size: 32
-    max_shards: None
+    max_shards: null
     overwrite: True
 
   hbf:
     checkpoint: "epoch_0001.pt"
     batch_size: 32
     dynamics_hidden_dim: 128
-    max_shards: None
+    max_shards: null
     overwrite: True
 
   mbai:
     batch_size: 32
-    max_shards: None
-    overwrite: False
+    max_shards: null
+    overwrite: True
     fusion_weights: None
 
   e2e_training:
