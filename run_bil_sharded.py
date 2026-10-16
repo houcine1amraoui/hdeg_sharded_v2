@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import gc
 from pathlib import Path
 from typing import Any, Optional
@@ -518,6 +519,7 @@ def save_bil_representation_shard(
     seed: int,
     negative_slope: float,
     overwrite: bool,
+    checkpoint_metadata: dict,
 ) -> None:
     """
     Persist one BIL scientific representation shard.
@@ -623,6 +625,10 @@ def save_bil_representation_shard(
         "seed": int(seed),
     }
 
+    payload.update(checkpoint_metadata)
+    payload["source_bse_checkpoint_sha256"] = source_bse_payload["model_checkpoint_sha256"]
+    payload["source_dbrl_checkpoint_sha256"] = source_bse_payload["source_dbrl_checkpoint_sha256"]
+
     # Preserve the BSE execution metadata when present without allowing it
     # to overwrite BIL's authoritative fields.
     if "num_heads" in source_bse_payload:
@@ -687,6 +693,70 @@ def verify_bil_output_shard(
 # Main
 # ---------------------------------------------------------------------
 
+def load_trained_bil(model, checkpoint_path: Path, config: dict) -> dict:
+    """Load the trained BIL branch and verify its fixed behavioral graph."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"HDEG checkpoint not found: {checkpoint_path}")
+
+    # The trusted end-to-end checkpoint includes other modules and optimizer
+    # state; keep these on CPU while restoring only BIL.
+    with checkpoint_path.open("rb") as file:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+        file.seek(0)
+        payload = torch.load(file, map_location="cpu", weights_only=False)
+
+    if not isinstance(payload, dict):
+        raise TypeError("Expected an end-to-end HDEG checkpoint dictionary.")
+    state = payload.get("model_state_dict")
+    saved_config = payload.get("config")
+    if not isinstance(state, dict) or not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint must contain model_state_dict and config.")
+    for key in ("dataset_name", "merge_bre_cu", "window_size", "downsample_freq"):
+        if saved_config["preprocessing"][key] != config["preprocessing"][key]:
+            raise ValueError(f"Preprocessing checkpoint/config mismatch: {key}")
+
+    # Both graph buffers must match the frozen BIG used by this runner.
+    for name in ("edge_index", "incoming_mask"):
+        saved_buffer = state.get(f"bil.{name}")
+        current_buffer = getattr(model, name).detach().cpu()
+        if not isinstance(saved_buffer, torch.Tensor):
+            raise ValueError(f"Checkpoint is missing bil.{name}.")
+        if saved_buffer.shape != current_buffer.shape or not torch.equal(saved_buffer, current_buffer):
+            raise ValueError(f"BIL graph buffer differs from checkpoint: {name}")
+
+    bil_state = {
+        key[len("bil."):]: value
+        for key, value in state.items()
+        if isinstance(key, str) and key.startswith("bil.")
+    }
+    if not bil_state:
+        raise ValueError("Checkpoint contains no bil. parameters.")
+    model.load_state_dict(bil_state, strict=True)
+    model.eval()
+
+    return {
+        "model_checkpoint": str(checkpoint_path.resolve()),
+        "model_checkpoint_sha256": digest.hexdigest(),
+        "model_checkpoint_epoch": int(payload["epoch"]),
+        "model_source": "train_hdeg_e2e.py checkpoint / bil submodule",
+    }
+
+
+def verify_bse_checkpoint(payload: dict, checkpoint_metadata: dict, shard_path: Path) -> None:
+    """Reject legacy or mixed-checkpoint BSE/DBRL inputs before inference."""
+    expected = checkpoint_metadata["model_checkpoint_sha256"]
+    for field in ("model_checkpoint_sha256", "source_dbrl_checkpoint_sha256"):
+        observed = payload.get(field)
+        if observed != expected:
+            raise ValueError(
+                f"BSE provenance missing or mismatched in {shard_path}: "
+                f"{field}: expected={expected}, observed={observed!r}. "
+                "Regenerate upstream artifacts with the corrected exporters and the same checkpoint."
+            )
+
+
 def main() -> None:
     with open("configs/config.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -731,7 +801,7 @@ def main() -> None:
 
     bse_split_dir = (
         bse_dir
-        / args.split
+        / split
     )
 
     bil_dir = (
@@ -740,7 +810,7 @@ def main() -> None:
 
     bil_split_dir = (
         bil_dir
-        / args.split
+        / split
     )
 
     # -------------------------------------------------------------
@@ -857,7 +927,17 @@ def main() -> None:
         embedding_dim=embedding_dim,
     ).to(device)
 
-    model.eval()
+    checkpoint = config["hdeg"]["hbf"]["checkpoint"]
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = processed_data_folder / "hdeg_checkpoints" / checkpoint_path
+    checkpoint_metadata = load_trained_bil(model, checkpoint_path, config)
+    print(f"Trained BIL loaded: {checkpoint_path}")
+    print(f"Checkpoint epoch: {checkpoint_metadata['model_checkpoint_epoch']}")
+    print(f"Checkpoint SHA256: {checkpoint_metadata['model_checkpoint_sha256']}")
+    print("[PASS] Behavioral interaction graph matches checkpoint.")
 
     parameter_count = sum(
         parameter.numel()
@@ -915,6 +995,9 @@ def main() -> None:
                 expected_embedding_dim=embedding_dim,
             )
         )
+
+        verify_bse_checkpoint(payload, checkpoint_metadata, shard_path)
+        print("[PASS] BSE and upstream DBRL checkpoint hashes match BIL checkpoint.")
 
         S = payload["representations"]
 
@@ -1038,6 +1121,7 @@ def main() -> None:
                 model.negative_slope
             ),
             overwrite=overwrite,
+            checkpoint_metadata=checkpoint_metadata,
         )
 
         print()
