@@ -47,8 +47,8 @@ hdeg:
     graph_self_loops: True
     graph_symmetric: True
     graph_heads: 1
-    max_batches: None
-    max_shards: None
+    max_batches: null
+    max_shards: null
     overwrite: False
 
   bse:
@@ -66,7 +66,7 @@ hdeg:
   ebrl:
     batch_size: 32
     max_shards: None
-    overwrite: False
+    overwrite: True
 
   hbf:
     checkpoint: "epoch_0001.pt"
