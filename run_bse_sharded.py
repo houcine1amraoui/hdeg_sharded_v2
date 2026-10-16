@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import gc
 from pathlib import Path
 from typing import Any, Optional
@@ -572,6 +573,7 @@ def save_bse_representation_shard(
     num_heads: int,
     seed: int,
     overwrite: bool,
+    checkpoint_metadata: dict,
 ) -> None:
     """
     Persist one BSE representation shard.
@@ -657,6 +659,8 @@ def save_bse_representation_shard(
         # Execution provenance
         "seed": int(seed),
     }
+    payload.update(checkpoint_metadata)
+    payload["source_dbrl_checkpoint_sha256"] = source_dbrl_payload["model_checkpoint_sha256"]
 
     torch.save(
         payload,
@@ -706,6 +710,69 @@ def verify_bse_output_shard(
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
+
+def load_trained_bse(model, checkpoint_path: Path, config: dict, compatibility_mask) -> dict:
+    """Load the BSE branch and verify its semantic mask against training."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"HDEG checkpoint not found: {checkpoint_path}")
+
+    # The trusted end-to-end checkpoint includes other modules and optimizer
+    # state; keep these on CPU while restoring only BSE.
+    with checkpoint_path.open("rb") as file:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+        file.seek(0)
+        payload = torch.load(file, map_location="cpu", weights_only=False)
+
+    if not isinstance(payload, dict):
+        raise TypeError("Expected an end-to-end HDEG checkpoint dictionary.")
+    state = payload.get("model_state_dict")
+    saved_config = payload.get("config")
+    if not isinstance(state, dict) or not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint must contain model_state_dict and config.")
+    if saved_config["hdeg"]["bse"]["num_heads"] != config["hdeg"]["bse"]["num_heads"]:
+        raise ValueError("BSE checkpoint/config mismatch: num_heads")
+    for key in ("dataset_name", "merge_bre_cu", "window_size", "downsample_freq"):
+        if saved_config["preprocessing"][key] != config["preprocessing"][key]:
+            raise ValueError(f"Preprocessing checkpoint/config mismatch: {key}")
+
+    saved_mask = state.get("compatibility_mask")
+    if not isinstance(saved_mask, torch.Tensor):
+        raise ValueError("Checkpoint is missing the trained compatibility_mask.")
+    current_mask = compatibility_mask.detach().cpu()
+    if saved_mask.shape != current_mask.shape or not torch.equal(saved_mask, current_mask):
+        raise ValueError("Current behavioral compatibility mask differs from the checkpoint.")
+
+    bse_state = {
+        key[len("bse."):]: value
+        for key, value in state.items()
+        if isinstance(key, str) and key.startswith("bse.")
+    }
+    if not bse_state:
+        raise ValueError("Checkpoint contains no bse. parameters.")
+    model.load_state_dict(bse_state, strict=True)
+    model.eval()
+
+    return {
+        "model_checkpoint": str(checkpoint_path.resolve()),
+        "model_checkpoint_sha256": digest.hexdigest(),
+        "model_checkpoint_epoch": int(payload["epoch"]),
+        "model_source": "train_hdeg_e2e.py checkpoint / bse submodule",
+    }
+
+
+def verify_dbrl_checkpoint(payload: dict, checkpoint_metadata: dict, shard_path: Path) -> None:
+    """Reject legacy or mixed-checkpoint inputs before BSE inference."""
+    observed = payload.get("model_checkpoint_sha256")
+    expected = checkpoint_metadata["model_checkpoint_sha256"]
+    if observed != expected:
+        raise ValueError(
+            f"DBRL checkpoint hash missing or mismatched in {shard_path}: "
+            f"expected={expected}, observed={observed!r}. "
+            "Regenerate this split with the corrected DBRL exporter and the same checkpoint."
+        )
+
 
 def main() -> None:
     with open("configs/config.yaml", "r", encoding="utf-8") as f:
@@ -968,7 +1035,19 @@ def main() -> None:
         num_heads=num_heads,
     ).to(device)
 
-    model.eval()
+    checkpoint = config["hdeg"]["hbf"]["checkpoint"]
+    if not isinstance(checkpoint, str) or not checkpoint.strip():
+        raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = processed_data_folder / "hdeg_checkpoints" / checkpoint_path
+    checkpoint_metadata = load_trained_bse(
+        model, checkpoint_path, config, compatibility_mask
+    )
+    print(f"Trained BSE loaded: {checkpoint_path}")
+    print(f"Checkpoint epoch: {checkpoint_metadata['model_checkpoint_epoch']}")
+    print(f"Checkpoint SHA256: {checkpoint_metadata['model_checkpoint_sha256']}")
+    print("[PASS] Behavioral compatibility mask matches checkpoint.")
 
     parameter_count = sum(
         parameter.numel()
@@ -1013,6 +1092,9 @@ def main() -> None:
             expected_num_devices=num_devices,
             expected_embedding_dim=embedding_dim,
         )
+
+        verify_dbrl_checkpoint(payload, checkpoint_metadata, shard_path)
+        print("[PASS] DBRL checkpoint hash matches BSE checkpoint.")
 
         Z = payload["representations"]
 
@@ -1112,6 +1194,7 @@ def main() -> None:
             num_heads=num_heads,
             seed=int(config["seed"]),
             overwrite=overwrite,
+            checkpoint_metadata=checkpoint_metadata,
         )
 
         print()
