@@ -18,17 +18,16 @@ split into RAM. It checks:
 
 It produces a machine-readable audit JSON and a human-readable report.
 
-IMPORTANT:
-The current frozen run_hbf_sharded.py in the supplied codebase constructs a
-fresh HBF and has its checkpoint-loading code commented out. Therefore this
-audit intentionally treats HBF trained-model provenance as a separate,
-explicit check. A complete scientific inference package must not claim a
-trained HBF unless a selected checkpoint is actually loaded and recorded.
+Scope:
+PASS means that persisted artifact structure, recorded checkpoint provenance,
+and temporal coverage are consistent. It does not establish scientific
+representation quality or independently reproduce model inference.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -40,6 +39,8 @@ from src.utils.seed import set_seed
 from src.utils.get_folders_utils import get_processed_folder
 
 LEVELS = ("Z", "S", "S_tilde", "g")
+STAGES = ("dbrl", "bse", "bil", "ebrl", "hbf", "mbai")
+SPLITS = ("train", "val", "actor2_test", "actor1_test")
 
 
 def shard_index(path: Path) -> int:
@@ -168,169 +169,195 @@ def validate_rep_payload(
     return start, end, int(payload["window_size"])
 
 
-def audit_split(base: Path, split: str, audit: Audit):
-    dirs = {k: base / k / split for k in ("dbrl", "bse", "bil", "ebrl", "hbf", "mbai")}
-    paths = {k: discover(v) for k, v in dirs.items()}
+def validate_provenance(payload, path, stage, checkpoint_sha256, index):
+    upstream = STAGES[:STAGES.index(stage)]
+    fields = ["model_checkpoint_sha256"] + [
+        f"source_{source}_checkpoint_sha256" for source in upstream
+    ]
+    for field in fields:
+        if payload.get(field) != checkpoint_sha256:
+            raise RuntimeError(
+                f"{path}: {field} mismatch: expected {checkpoint_sha256}, "
+                f"got {payload.get(field)!r}"
+            )
+    for source in upstream:
+        field = f"source_{source}_shard_index"
+        if int(payload.get(field, -1)) != index:
+            raise RuntimeError(f"{path}: {field} mismatch")
 
-    counts = {k: len(v) for k, v in paths.items()}
-    if len(set(counts.values())) != 1:
-        audit.fail("shard_count_consistency", str(counts))
-        return
+
+def audit_split(base: Path, split: str, audit: Audit, checkpoint_sha256: str):
+    # The source manifest prevents an equally truncated set of all six stages
+    # from passing as a complete split. Window arrays need not be loaded.
+    manifest_path = base / "windows" / split / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    M = int(manifest["num_samples"])
+    shard_size = int(manifest["shard_size"])
+    shard_count = int(manifest["num_shards"])
+    N, W = int(manifest["num_devices"]), int(manifest["window_size"])
+    if manifest["split"] != split or min(M, shard_size, shard_count, N, W) <= 0:
+        raise RuntimeError(f"Invalid source window manifest: {manifest_path}")
+    if shard_count != (M + shard_size - 1) // shard_size:
+        raise RuntimeError("Window manifest sample/shard counts disagree")
+    names = [Path(p).name for p in manifest["shards"]]
+    expected_names = [f"shard_{i:06d}.npz" for i in range(shard_count)]
+    if names != expected_names:
+        raise RuntimeError("Window manifest shard list is inconsistent")
+    actual_names = sorted(p.name for p in manifest_path.parent.glob("shard_*.npz"))
+    if actual_names != names:
+        raise RuntimeError("Window files differ from the source manifest shard list")
+    audit.ok("window_manifest", f"{M} windows, {shard_count} shards; W={W}, N={N}")
+
+    paths = {stage: discover(base / stage / split) for stage in STAGES[:-1]}
+    # A final representation shard containing one row has no MBAI target.
+    mbai_count = shard_count - int(M - (shard_count - 1) * shard_size == 1)
+    mbai_dir = base / "mbai" / split
+    paths["mbai"] = (
+        discover(mbai_dir) if mbai_count else sorted(mbai_dir.glob("shard_*.pt"))
+    )
+    counts = {stage: len(items) for stage, items in paths.items()}
+    for stage, count in counts.items():
+        required = mbai_count if stage == "mbai" else shard_count
+        if count != required:
+            raise RuntimeError(f"{stage}: expected {required} shards; found {count}")
     audit.ok("shard_count_consistency", str(counts))
 
-    # Establish N/K/D from the first artifacts.
-    d0, s0, b0, e0 = (load(paths[k][0]) for k in ("dbrl", "bse", "bil", "ebrl"))
-    N = int(d0["num_devices"])
-    D = int(d0["embedding_dim"])
-    K = int(s0["num_states"])
+    first = load(paths["dbrl"][0])
+    D = int(first["embedding_dim"])
+    del first
+    first = load(paths["bse"][0])
+    K = int(first["num_states"])
+    del first
+    if min(D, K) <= 0:
+        raise RuntimeError("Embedding/state dimensions must be positive")
 
-    expected = 0
-    total = 0
-
-    for i in range(len(paths["dbrl"])):
-        loaded = {k: load(paths[k][i]) for k in ("dbrl", "bse", "bil", "ebrl")}
-        ranges = {}
-
-        for level, key, require_k in (
-            ("Z", "dbrl", False),
-            ("S", "bse", True),
-            ("S_tilde", "bil", True),
-            ("g", "ebrl", True),
-        ):
-            start, end, W = validate_rep_payload(
-                loaded[key], paths[key][i],
-                split=split, level=level,
-                N=N, K=K, D=D,
-                expected_start=expected,
-                require_num_states=require_k,
-            )
-            ranges[key] = (start, end)
-            if W != int(d0["window_size"]):
-                raise RuntimeError(f"{paths[key][i]}: window_size mismatch")
-
-        if len(set(ranges.values())) != 1:
-            raise RuntimeError(f"representation range mismatch at shard {i}: {ranges}")
-
-        # Frozen provenance chain.
-        if int(loaded["bse"].get("source_dbrl_shard_index", -1)) != i:
-            raise RuntimeError(f"BSE provenance mismatch at shard {i}")
-        if int(loaded["bil"].get("source_bse_shard_index", -1)) != i:
-            raise RuntimeError(f"BIL -> BSE provenance mismatch at shard {i}")
-        if int(loaded["bil"].get("source_dbrl_shard_index", -1)) != i:
-            raise RuntimeError(f"BIL -> DBRL provenance mismatch at shard {i}")
-        if int(loaded["ebrl"].get("source_bil_shard_index", -1)) != i:
-            raise RuntimeError(f"EBRL -> BIL provenance mismatch at shard {i}")
-
-        expected = ranges["dbrl"][1]
-        total += expected - ranges["dbrl"][0]
-
-    audit.ok(
-        "representation_chain",
-        f"{total} samples; N={N}, K={K}, D={D}, shards={len(paths['dbrl'])}",
-    )
-
-    # HBF artifact audit.
-    expected = 0
-    for i, p in enumerate(paths["hbf"]):
-        h = load(p)
-        start, end = int(h["start_index"]), int(h["end_index"])
-        if start != expected or end <= start:
-            raise RuntimeError(f"HBF range mismatch at shard {i}: [{start},{end})")
-        for level, ndim in (("Z",3),("S",3),("S_tilde",3),("g",2)):
-            x = h[level]
-            if x.dtype != torch.float32 or x.ndim != ndim or not torch.isfinite(x).all():
-                raise RuntimeError(f"HBF {level} invalid at shard {i}")
-        if h["Z"].shape[1:] != (N,D):
-            raise RuntimeError(f"HBF Z shape mismatch at shard {i}")
-        if h["S"].shape[1:] != (K,D) or h["S_tilde"].shape[1:] != (K,D):
-            raise RuntimeError(f"HBF state shape mismatch at shard {i}")
-        if h["g"].shape[1:] != (D,):
-            raise RuntimeError(f"HBF g shape mismatch at shard {i}")
-        expected = end
-
-    audit.ok("hbf_artifacts", f"{expected} prediction rows")
-
-    # MBAI audit.
-    expected_target = 1
     total_m = 0
-    for i, p in enumerate(paths["mbai"]):
-        m = load(p)
-        ts, te = int(m["target_start_index"]), int(m["target_end_index"])
-        if ts != expected_target or te <= ts:
-            raise RuntimeError(
-                f"MBAI target range mismatch at shard {i}: "
-                f"[{ts},{te}), expected start {expected_target}"
+    weights_reference = None
+    for i in range(shard_count):
+        start, end = i * shard_size, min((i + 1) * shard_size, M)
+        for level, stage in zip(LEVELS, STAGES[:4]):
+            path = paths[stage][i]
+            payload = load(path)
+            validate_provenance(payload, path, stage, checkpoint_sha256, i)
+            got_start, got_end, got_W = validate_rep_payload(
+                payload, path, split=split, level=level, N=N, K=K, D=D,
+                expected_start=start, require_num_states=(stage != "dbrl"),
             )
-        n = te - ts
-        for key in ("E_Z","E_S","E_S_tilde","E_G","A"):
-            x = m[key]
-            if x.dtype != torch.float32 or x.ndim != 1 or x.shape[0] != n:
-                raise RuntimeError(f"MBAI {key} invalid at shard {i}")
-            if not torch.isfinite(x).all():
-                raise RuntimeError(f"MBAI {key} contains NaN/Inf at shard {i}")
-        if int(m["source_hbf_shard_index"]) != i:
-            raise RuntimeError(f"MBAI HBF provenance mismatch at shard {i}")
-        expected_target = te
-        total_m += n
+            if (got_start, got_end, got_W) != (start, end, W):
+                raise RuntimeError(f"{path}: range/window differs from source manifest")
+            del payload
 
-    audit.ok(
-        "mbai_temporal_coverage",
-        f"{total_m} aligned assessments; target range [1,{expected_target})",
-    )
+        path = paths["hbf"][i]
+        h = load(path)
+        validate_provenance(h, path, "hbf", checkpoint_sha256, i)
+        for level in LEVELS:
+            # Reuse structural validation without copying tensor storage.
+            proxy = {**h, "representations": h[level]}
+            hs, he, hw = validate_rep_payload(
+                proxy, path, split=split, level=level, N=N, K=K, D=D,
+                expected_start=start, require_num_states=True,
+            )
+            if (hs, he, hw) != (start, end, W):
+                raise RuntimeError(f"{path}: HBF range/window mismatch")
+            del proxy
+        del h
 
-    if total_m == total - 1:
-        audit.ok("final_prediction_boundary", "exactly one final unpaired prediction excluded")
-    else:
-        audit.fail(
-            "final_prediction_boundary",
-            f"expected {total-1} assessments from {total} predictions; got {total_m}",
-        )
+        if i < mbai_count:
+            path = paths["mbai"][i]
+            m = load(path)
+            validate_provenance(m, path, "mbai", checkpoint_sha256, i)
+            ts, te = start + 1, min(end + 1, M)
+            expected_meta = {
+                "split": split, "shard_index": i, "window_size": W,
+                "num_devices": N, "num_states": K, "embedding_dim": D,
+                "source_hbf_start_index": start, "source_hbf_end_index": end,
+                "target_start_index": ts, "target_end_index": te,
+                "start_index": ts, "end_index": te, "num_samples": te - ts,
+                "final_prediction_excluded": i == shard_count - 1,
+                "last_prediction_excluded": i == shard_count - 1,
+                "run_truncated": False,
+            }
+            for field, expected in expected_meta.items():
+                if m.get(field) != expected:
+                    raise RuntimeError(
+                        f"{path}: {field}: expected {expected!r}, got {m.get(field)!r}"
+                    )
+            for key in ("E_Z", "E_S", "E_S_tilde", "E_G", "A"):
+                x = m[key]
+                if not isinstance(x, torch.Tensor) or x.dtype != torch.float32:
+                    raise RuntimeError(f"{path}: {key} must be a float32 tensor")
+                if tuple(x.shape) != (te - ts,) or not torch.isfinite(x).all():
+                    raise RuntimeError(f"{path}: {key} shape/finiteness mismatch")
+                if (x < 0).any():
+                    raise RuntimeError(f"{path}: {key} contains negative anomaly evidence")
+            weights = m["fusion_weights"]
+            if not isinstance(weights, dict) or set(weights) != set(LEVELS):
+                raise RuntimeError(f"{path}: invalid fusion weight keys")
+            if any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not math.isfinite(v) or v < 0 for v in weights.values()):
+                raise RuntimeError(f"{path}: invalid fusion weights")
+            if sum(weights.values()) <= 0:
+                raise RuntimeError(f"{path}: fusion weights sum must be positive")
+            if weights_reference is not None and weights != weights_reference:
+                raise RuntimeError(f"{path}: fusion weights changed between shards")
+            weights_reference = weights
+            total_m += te - ts
+            del m, x
+        print(f"[PASS] artifact shard {i + 1}/{shard_count}: ranges, tensors, provenance")
 
-    # Critical trained-HBF provenance check.
-    # The current supplied run_hbf_sharded.py does not load a checkpoint.
-    audit.fail(
-        "hbf_trained_model_provenance",
-        "Current run_hbf_sharded.py constructs a fresh HBF and has checkpoint loading commented out. "
-        "The persisted HBF artifacts therefore cannot be certified as outputs of the selected trained "
-        "HDEG model until the runner loads and records a specific training checkpoint.",
-    )
-
-    return total, total_m
+    if total_m != M - 1:
+        raise RuntimeError(f"Expected {M-1} aligned assessments; got {total_m}")
+    audit.ok("representation_chain", f"{M} samples; N={N}, K={K}, D={D}, W={W}")
+    audit.ok("hbf_artifacts", f"{M} prediction rows aligned with source shards")
+    audit.ok("checkpoint_provenance", f"All stages and recorded ancestors match {checkpoint_sha256}")
+    audit.ok("mbai_temporal_coverage", f"{total_m} aligned assessments; target range [1,{M})")
+    audit.ok("final_prediction_boundary", "exactly one final unpaired prediction excluded")
+    return M, total_m
 
 
 def main():
 
     with open("configs/config.yaml", "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f)
-        
-    set_seed(config["seed"])
+        config = yaml.safe_load(f)
 
-    # # parse CLI args
     parser = argparse.ArgumentParser()
     parser.add_argument("--project_root_dir", type=str)
-
-    seed = int(config["seed"])
-    set_seed(seed)
-
-    project_root_dir = config["project_root_dir"]
-    split = "train"
-    
-    processed_root = get_processed_folder(config)
-
-    dataset = config["preprocessing"]["dataset_name"]
-
-    output = f"{processed_root}/audit_reports/artifact_audit_{split}.json"
-
-    base = Path(f"{project_root_dir}/data/processed/{dataset}")
+    parser.add_argument("--split", choices=SPLITS)
+    args = parser.parse_args()
+    if args.project_root_dir is not None:
+        config["project_root_dir"] = args.project_root_dir
+    if args.split is not None:
+        config["split"] = args.split
+    split = config.get("split")
+    if split not in SPLITS:
+        raise ValueError(f"Set config split or --split to one of {SPLITS}.")
+    set_seed(int(config["seed"]))
+    base = Path(get_processed_folder(config))
+    dataset = base.name
+    output = base / "audit_reports" / f"artifact_audit_{split}.json"
     a = Audit()
-
     total = total_m = None
+    checkpoint_path = None
+    checkpoint_sha256 = None
     try:
-        total, total_m = audit_split(base, split, a)
+        checkpoint = config["hdeg"]["hbf"].get("checkpoint")
+        if not isinstance(checkpoint, str) or not checkpoint.strip():
+            raise ValueError("hdeg.hbf.checkpoint must name an HDEG checkpoint.")
+        checkpoint_path = Path(checkpoint)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = base / "hdeg_checkpoints" / checkpoint_path
+        checkpoint_sha256 = sha256(checkpoint_path)
+        a.ok("selected_checkpoint", str(checkpoint_path))
+        print(f"Split: {split}")
+        print(f"Checkpoint SHA256: {checkpoint_sha256}")
+        total, total_m = audit_split(base, split, a, checkpoint_sha256)
     except Exception as exc:
         a.fail("artifact_chain", str(exc))
 
     report = {
+        "audit_scope": "artifact structure, recorded provenance, and full-split temporal coverage",
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+        "checkpoint_sha256": checkpoint_sha256,
         "dataset": dataset,
         "split": split,
         "total_prediction_rows": total,
@@ -341,11 +368,12 @@ def main():
         "warnings": a.warnings,
     }
 
-    out = Path(output) if output else base / "inference_evidence_package" / f"artifact_audit_{split}.json"
+    out = output
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print(json.dumps(report, indent=2))
+    print(f"Audit report: {out}")
     raise SystemExit(0 if not a.errors else 2)
 
 
