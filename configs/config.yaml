@@ -79,7 +79,7 @@ hdeg:
     batch_size: 32
     max_shards: null
     overwrite: True
-    fusion_weights: None
+    fusion_weights: null
 
   e2e_training:
     epochs: 1
