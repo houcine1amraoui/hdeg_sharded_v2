@@ -3,8 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict
+from numbers import Integral
 import numpy as np
+
+
+CONDITION_ORDER = ("N1", "A2", "N2")
+
+
+def _nonnegative_integer(value, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer")
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 @dataclass(frozen=True)
@@ -23,11 +36,18 @@ def deterministic_pairs(
     Pair selection depends only on population size, seed and pair count.
     It never inspects representation values.
     """
+    n = _nonnegative_integer(n, "n")
+    count = _nonnegative_integer(count, "count")
+    seed = _nonnegative_integer(seed, "seed")
+    if n > np.iinfo(np.int64).max:
+        raise ValueError("Population exceeds int64 index range")
     if n < 2:
         return np.empty((0, 2), dtype=np.int64)
 
     total = n * (n - 1) // 2
-    m = min(int(count), total)
+    if total > np.iinfo(np.int64).max:
+        raise ValueError("Unordered pair population exceeds int64 rank range")
+    m = min(count, total)
 
     rng = np.random.default_rng(seed)
 
@@ -64,7 +84,12 @@ def deterministic_sample_indices(
     seed: int = 42,
 ) -> np.ndarray:
     """Deterministic without-replacement sample of population indices."""
-    if n <= 0:
+    n = _nonnegative_integer(n, "n")
+    count = _nonnegative_integer(count, "count")
+    seed = _nonnegative_integer(seed, "seed")
+    if n > np.iinfo(np.int64).max:
+        raise ValueError("Population exceeds int64 index range")
+    if n == 0:
         return np.empty(0, dtype=np.int64)
     m = min(int(count), n)
     rng = np.random.default_rng(seed)
@@ -78,12 +103,24 @@ def condition_sampling_plan(
     max_per_condition: int = 50_000,
     seed: int = 42,
 ) -> Dict[str, np.ndarray]:
-    """Create representation-blind per-condition sample indices."""
+    """Use the engine's N1/A2/N2 seed assignment, independent of dict order.
+
+    For other condition names, retain deterministic alphabetical ordering.
+    Sorted returned row indices preserve chronology but not temporal adjacency.
+    """
+    max_per_condition = _nonnegative_integer(max_per_condition, "max_per_condition")
+    seed = _nonnegative_integer(seed, "seed")
+    if any(not isinstance(name, str) for name in populations):
+        raise TypeError("Condition names must be strings")
+    if set(populations).issubset(CONDITION_ORDER):
+        # Keep offsets stable even when a subset of HDEG conditions is requested.
+        ordered = [(k, name) for k, name in enumerate(CONDITION_ORDER)
+                   if name in populations]
+    else:
+        ordered = list(enumerate(sorted(populations)))
     return {
         name: deterministic_sample_indices(
-            n,
-            min(max_per_condition, n),
-            seed=seed + k,
+            populations[name], max_per_condition, seed=seed + k
         )
-        for k, (name, n) in enumerate(sorted(populations.items()))
+        for k, name in ordered
     }
