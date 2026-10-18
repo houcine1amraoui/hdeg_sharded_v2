@@ -202,3 +202,94 @@ def inventory(checkpoint_directory, history_paths):
                 history_search_scope='Only explicitly supplied --history files',
                 learning_curve_evidence='unavailable' if not histories else 'requires_content_and_provenance_review',
                 convergence='not_established', validation_selection='not_established')
+
+
+def load_experiment_context(manifest_path, active_config, processed_folder):
+    """Verify preserved-run inputs before selecting its output namespace.
+
+    The snapshot is authoritative in this explicit mode. Current config differences
+    remain visible, and critical differences are rejected. Historical Level 1
+    identifies a different experiment; it never certifies the new checkpoint.
+    """
+    import copy
+    import yaml
+    manifest_path = Path(manifest_path).resolve()
+    require(manifest_path.name == 'experiment_manifest.json', 'Expected experiment_manifest.json')
+    manifest_hash = sha256_file(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    require(manifest.get('status') == 'PRESERVED', 'Experiment must have status PRESERVED')
+    require(manifest.get('scientific_tests_executed') is False, 'Unexpected preservation manifest status')
+    root = manifest_path.parent
+    base = Path(processed_folder(active_config)).resolve()
+    require(root.parent == (base/'experiments').resolve(),
+            'Experiment must be a direct child of the active processed experiments directory')
+    require(root != base and root.parent != root, 'Invalid experiment root')
+    # Refuse symlink routing out of the experiment, including an existing validation directory.
+    require((root/'validation').resolve() == root/'validation', 'Validation path must not be redirected')
+    require((root/'validation'/'preflight').resolve() == root/'validation'/'preflight',
+            'Preflight output path must not be redirected')
+    snapshot_path = root/'config_snapshot.yaml'
+    require(snapshot_path.resolve() == snapshot_path, 'Snapshot must reside in this experiment')
+    snapshot_hash = sha256_file(snapshot_path)
+    require(snapshot_hash == manifest.get('configuration_snapshot_sha256'), 'Configuration snapshot hash mismatch')
+    snapshot = yaml.safe_load(snapshot_path.read_text())
+    require(isinstance(snapshot, dict), 'Configuration snapshot must be a mapping')
+    differences = config_differences(active_config, snapshot)
+    require(not any(d['category'] == 'experiment_critical' for d in differences),
+            'Active configuration differs from snapshot in experiment-critical settings')
+    effective = copy.deepcopy(snapshot)
+    # Keep the established CLI project-root override; record the original snapshot separately.
+    effective['project_root_dir'] = active_config['project_root_dir']
+    require(Path(processed_folder(effective)).resolve() == base,
+            'Snapshot and active configuration select different processed data roots')
+    checkpoint = Path(manifest['checkpoint'])
+    require(checkpoint.is_absolute(), 'Preserved checkpoint path must be absolute')
+    checkpoint = checkpoint.resolve()
+    require(checkpoint.parent == root/'checkpoints', 'Checkpoint must reside inside this experiment/checkpoints')
+    require(Path(snapshot['hdeg']['hbf']['checkpoint']).is_absolute() and
+            Path(snapshot['hdeg']['hbf']['checkpoint']).resolve() == checkpoint,
+            'Snapshot checkpoint differs from experiment manifest')
+    digest = sha256_file(checkpoint)
+    require(digest == manifest.get('checkpoint_sha256'), 'Preserved checkpoint hash mismatch')
+    legacy = manifest.get('legacy_reference')
+    require(isinstance(legacy, dict), 'Missing historical reference metadata')
+    for field in ('sha256','checkpoint_sha256'):
+        value = legacy.get(field)
+        require(isinstance(value,str) and len(value)==64 and
+                all(c in '0123456789abcdef' for c in value), 'Invalid historical '+field)
+    require(manifest.get('is_same_checkpoint_as_level1') is (digest == legacy['checkpoint_sha256']),
+            'Inconsistent checkpoint relationship in manifest')
+    historical_path = Path(legacy['path']).resolve()
+    require(historical_path == base/'v1_validation'/'preflight.json',
+            'Historical reference must point to the preserved Level 1 preflight')
+    tracked = {str(manifest_path):manifest_hash, str(snapshot_path):snapshot_hash,
+               str(checkpoint):digest}
+    historical = dict(**legacy, role='historical_provenance_only',
+                      evidence_applies_to_current_checkpoint=False,
+                      validation_manifest_reused_as_gate=False)
+    if historical_path.is_file():
+        require(sha256_file(historical_path)==legacy['sha256'], 'Historical preflight content changed')
+        old = json.loads(historical_path.read_text())
+        require(old.get('status')=='PASS' and old.get('checkpoint_sha256')==legacy['checkpoint_sha256'],
+                'Historical preflight contradicts preservation manifest')
+        tracked[str(historical_path)] = legacy['sha256']
+        historical['file_verification'] = 'VERIFIED'
+    else:
+        historical['file_verification'] = 'UNAVAILABLE; recorded metadata only'
+    marker_path = base/'HDEG_OUTPUTS_PROTECTED.json'
+    marker = json.loads(marker_path.read_text())
+    require(marker.get('schema_version')==1 and marker.get('level1_reference')==legacy,
+            'Protection marker differs from preserved historical reference')
+    tracked[str(marker_path)] = sha256_file(marker_path)
+    # Catch changes to an input while it was being parsed.
+    for source, expected in tracked.items():
+        require(sha256_file(source)==expected, 'Experiment input changed during verification: '+source)
+    return dict(config=effective, checkpoint=checkpoint, base=base,
+                output_parent=root/'validation'/'preflight', tracked_hashes=tracked,
+                provenance=dict(mode='new_experiment', experiment_id=root.name,
+                    manifest_path=str(manifest_path), manifest_sha256=manifest_hash,
+                    snapshot_path=str(snapshot_path), snapshot_sha256=snapshot_hash,
+                    snapshot_configuration=snapshot, active_configuration=active_config,
+                    active_snapshot_differences=differences,
+                    checkpoint_sha256=digest, historical_level1_reference=historical,
+                    current_checkpoint_level1_status='NOT_ESTABLISHED_IN_THIS_RUN'))
