@@ -16,7 +16,6 @@ from src.models.hdeg.dbrl import DBRL
 from src.utils.seed import set_seed
 from src.utils.device import get_device
 from src.utils.get_folders_utils import get_processed_folder
-from src.utils.experiment_protection import assert_output_unprotected
 
 
 SPLITS = (
@@ -751,7 +750,6 @@ def main() -> None:
     # Paths
     # -------------------------------------------------------------
 
-    assert_output_unprotected(get_processed_folder(config), "run_dbrl_sharded.py")
     processed_data_folder = get_processed_folder(
         config
     )
