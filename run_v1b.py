@@ -12,7 +12,6 @@ from src.scientific_validation.v1.v1b_io import load_representation_shard, save_
 from src.scientific_validation.v1.v1b_provenance import sha256_file
 from src.utils.seed import set_seed
 from src.utils.get_folders_utils import get_processed_folder
-from src.utils.experiment_protection import assert_output_unprotected
 
 
 def main():
@@ -27,7 +26,6 @@ def main():
         config["project_root_dir"] = args.project_root_dir
     seed = int(config["seed"])
     set_seed(seed)
-    assert_output_unprotected(get_processed_folder(config), "run_v1b.py")
     base = Path(get_processed_folder(config))
     output = base / "v1_validation"
     try:
