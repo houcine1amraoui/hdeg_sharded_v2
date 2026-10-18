@@ -57,6 +57,7 @@ from src.models.hdeg.mbai import MultiScaleBehavioralAnomalyInference
 from src.utils.device import get_device
 from src.utils.seed import set_seed
 from src.utils.get_folders_utils import get_processed_folder
+from src.utils.experiment_protection import assert_output_unprotected
 
 SPLITS = ("train", "val", "actor2_test", "actor1_test")
 LEVELS = ("Z", "S", "S_tilde", "g")
@@ -858,6 +859,7 @@ def main() -> None:
     overwrite = settings.get("overwrite", False)
     fusion_weights = settings.get("fusion_weights")
 
+    assert_output_unprotected(get_processed_folder(config), "run_mbai_sharded.py")
     base = Path(get_processed_folder(config))
     hbf_dir = base / "hbf" / split
     output_dir = base / "mbai" / split

@@ -14,6 +14,7 @@ from src.models.hdeg.ebrl import EcosystemBehavioralRepresentationLearner
 from src.utils.seed import set_seed
 from src.utils.device import get_device
 from src.utils.get_folders_utils import get_processed_folder
+from src.utils.experiment_protection import assert_output_unprotected
 
 SPLITS = (
     "train",
@@ -490,6 +491,7 @@ def main() -> None:
             raise ValueError("max_shards must be greater than zero.")
 
     
+    assert_output_unprotected(get_processed_folder(config), "run_ebrl_sharded.py")
     processed_root = get_processed_folder(config)
     bil_split_dir = Path(f"{processed_root}/bil/{split}")
     ebrl_split_dir = Path(f"{processed_root}/ebrl/{split}")
