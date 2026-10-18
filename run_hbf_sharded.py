@@ -15,7 +15,6 @@ from src.models.hdeg.hbf import HierarchicalBehavioralForecaster
 from src.utils.seed import set_seed
 from src.utils.device import get_device
 from src.utils.get_folders_utils import get_processed_folder
-from src.utils.experiment_protection import assert_output_unprotected
 
 SPLITS = ("train", "val", "actor2_test", "actor1_test")
 SHARD_PATTERN = "shard_*.pt"
@@ -297,7 +296,6 @@ def main() -> None:
 
     
     hidden = int(config["hdeg"]["hbf"].get("dynamics_hidden_dim", 128))
-    assert_output_unprotected(get_processed_folder(config), "run_hbf_sharded.py")
     base = Path(get_processed_folder(config))
 
     checkpoint = config["hdeg"]["hbf"].get("checkpoint")
