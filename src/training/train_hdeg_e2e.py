@@ -44,6 +44,9 @@ from src.models.hdeg.mo import ModelOptimization
 from src.common.graph.semantics import load_behavioral_state_config
 from src.utils.device import get_device
 from src.utils.get_folders_utils import get_processed_folder
+from src.utils.experiment_protection import (
+    fresh_run_directory, require_new_file, write_json_new, sha256_file,
+)
 from src.utils.seed import set_seed
 
 # Reuse the authoritative paired-window loading/manifest utilities from the
@@ -241,7 +244,10 @@ def save_checkpoint(
         "metrics": metrics.__dict__,
         "config": config,
     }
-    torch.save(payload, path)
+    # Exclusive creation: never truncate an existing checkpoint, including on resume.
+    require_new_file(path)
+    with path.open("xb") as stream:
+        torch.save(payload, stream)
 
 
 def load_checkpoint(
@@ -453,7 +459,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--project_root_dir", type=str, default=None)
     parser.add_argument("--config", type=str, default="configs/config.yaml")
-    parser.add_argument("--split", type=str, choices=SPLITS, default="train")
+    parser.add_argument("--split", type=str, choices=("train",), default="train")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -558,6 +564,25 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(trainable, lr=lr)
 
+    # Validate output paths before loading shards or performing optimization.
+    if args.checkpoint and not args.resume and not args.no_save:
+        require_new_file(Path(args.checkpoint))
+    checkpoint_dir = None
+    if not args.no_save:
+        checkpoint_dir = fresh_run_directory(
+            processed_data_folder / "hdeg_checkpoints" / "runs",
+            explicit=args.checkpoint_dir,
+        )
+        write_json_new(checkpoint_dir / "run_configuration.json", {
+            "status": "RESERVED", "configuration": config,
+            "epochs_requested": epochs, "batch_size": batch_size, "learning_rate": lr,
+            "resume_source": str(Path(args.checkpoint).resolve()) if args.resume and args.checkpoint else None,
+            "resume_source_sha256": sha256_file(args.checkpoint) if args.resume and args.checkpoint else None,
+            "max_shards": args.max_shards, "max_batches_per_shard": args.max_batches_per_shard,
+            "trainer_sha256": sha256_file(__file__),
+        })
+        print(f"Protected training output directory: {checkpoint_dir}", flush=True)
+
     start_epoch = 1
     if args.resume:
         if not args.checkpoint:
@@ -568,6 +593,9 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
         ) + 1
+
+    if start_epoch > epochs:
+        raise ValueError("Resume epoch is already at or beyond --epochs; no training or checkpoint write performed.")
 
     print("=" * 78)
     print("HDEG — END-TO-END TRAINING")
@@ -585,7 +613,6 @@ def main() -> None:
     print("Target representation  : LIVE AUTOGRAD (no detach)")
     print()
 
-    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else processed_data_folder / "hdeg_checkpoints"
 
     history = []
     for epoch in range(start_epoch, epochs + 1):
@@ -631,7 +658,7 @@ def main() -> None:
             )
             print(f"Checkpoint saved: {epoch_checkpoint}")
 
-    if args.checkpoint and not args.no_save:
+    if args.checkpoint and not args.resume and not args.no_save:
         final_metrics = metrics
         save_checkpoint(
             Path(args.checkpoint),
@@ -644,6 +671,14 @@ def main() -> None:
         print(f"Final checkpoint saved: {args.checkpoint}")
 
     print("=" * 78)
+    if not args.no_save:
+        write_json_new(checkpoint_dir / "completed.json", {
+            "status": "COMPLETE", "start_epoch": start_epoch, "final_epoch": epochs,
+            "checkpoints": [
+                {"path": str(p), "sha256": sha256_file(p)}
+                for p in sorted(checkpoint_dir.glob("epoch_*.pt"))
+            ],
+        })
     print("HDEG end-to-end training completed")
     print("=" * 78)
 
