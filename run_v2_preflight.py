@@ -12,7 +12,7 @@ from src.utils.get_folders_utils import get_processed_folder
 from src.scientific_validation.v2 import preflight as helper
 from src.scientific_validation.v2.preflight import (
     sha256_file, require, config_differences, audit_windows,
-    check_split_boundaries, inventory,
+    check_split_boundaries, inventory, load_experiment_context,
 )
 
 
@@ -25,6 +25,8 @@ def write_report(path, report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--project_root_dir')
+    parser.add_argument('--experiment_manifest', type=Path,
+                        help='Explicit preserved-run mode; use its checkpoint, snapshot and validation directory')
     parser.add_argument('--checkpoint', type=Path,
                         help='Defaults to hdeg.hbf.checkpoint; relative paths use hdeg_checkpoints')
     parser.add_argument('--expected_checkpoint_sha256',
@@ -34,16 +36,22 @@ def main():
     parser.add_argument('--history', action='append', type=Path, default=[],
                         help='Optional existing CSV/JSON/JSONL history; repeat for multiple files')
     args = parser.parse_args()
+    if args.experiment_manifest is not None and (args.checkpoint is not None or args.v1_preflight is not None):
+        parser.error('--experiment_manifest cannot be combined with --checkpoint or --v1_preflight')
     # Preserve the established configuration style and processed-path helper.
     with open('configs/config.yaml', encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
     require(isinstance(config, dict), 'config.yaml must contain a mapping')
     if args.project_root_dir is not None:
         config['project_root_dir'] = args.project_root_dir
+    context = None
+    if args.experiment_manifest is not None:
+        context = load_experiment_context(args.experiment_manifest, config, get_processed_folder)
+        config = context['config']
     base = Path(get_processed_folder(config)).resolve()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid.uuid4().hex[:8]
     # Always a fresh Level 2 directory; no user path can redirect output over Level 1.
-    output = base/'v2_validation'/'preflight'/run_id
+    output = (context['output_parent'] if context else base/'v2_validation'/'preflight')/run_id
     output.mkdir(parents=True, exist_ok=False)
     path = output/'preflight_report.json'
     started = time.perf_counter()
@@ -53,10 +61,14 @@ def main():
                   audit_scope='Frozen checkpoint and train/val readiness; no test-split evaluation',
                   source_code_sha256={Path(__file__).name: sha256_file(__file__),
                                       'v2/preflight.py': sha256_file(helper.__file__)})
+    report['mode'] = 'new_experiment' if context else 'level1_linked'
+    if context:
+        report['experiment'] = context['provenance']
+        report['warnings'].append('Historical Level 1 results do not validate this experiment; no Level 1 evidence is inherited')
     write_report(path, report)
     print(f'Level 2 preflight report: {path}', flush=True)
     try:
-        checkpoint = args.checkpoint or Path(config['hdeg']['hbf']['checkpoint'])
+        checkpoint = context['checkpoint'] if context else (args.checkpoint or Path(config['hdeg']['hbf']['checkpoint']))
         if not checkpoint.is_absolute():
             checkpoint = base/'hdeg_checkpoints'/checkpoint
         checkpoint = checkpoint.resolve()
@@ -64,7 +76,11 @@ def main():
         report['checkpoint'] = dict(path=str(checkpoint), sha256=digest)
         anchor_path = args.v1_preflight or base/'v1_validation'/'preflight.json'
         anchor = None
-        if anchor_path.is_file():
+        if context:
+            # Verified by the manifest helper solely as historical provenance.
+            # Do not impose its checkpoint or validation-manifest hashes on this new run.
+            pass
+        elif anchor_path.is_file():
             anchor = json.loads(anchor_path.read_text())
             require(anchor.get('status') == 'PASS', 'Level 1 preflight is not PASS')
             require(anchor.get('checkpoint_sha256') == digest, 'Checkpoint differs from Level 1')
@@ -163,6 +179,9 @@ def main():
         if anchor is not None:
             require(sha256_file(anchor_path) == report['level1_reference']['sha256'],
                     'Level 1 reference changed during preflight')
+        if context:
+            for source, expected_hash in context['tracked_hashes'].items():
+                require(sha256_file(source) == expected_hash, 'Experiment input changed during preflight: '+source)
         report.update(status='COMPLETE', readiness=dict(
             bounded_frozen_checkpoint_diagnostic='READY_WITH_REPORTED_LIMITATIONS',
             convergence='NOT_ESTABLISHED', best_validation_selection='NOT_ESTABLISHED',
